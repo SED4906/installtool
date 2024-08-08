@@ -1,12 +1,15 @@
 use core::ptr::addr_of;
 
+use limine::memory_map::EntryType;
 use x86::bits64::registers::rsp;
 use x86::bits64::vmx::{vmclear, vmlaunch, vmptrld, vmread, vmresume, vmwrite, vmxon};
 
-use x86::controlregs::{cr0_write, cr3, Cr0};
-use x86::msr::{IA32_PAT, IA32_VMX_BASIC, IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1, IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1, IA32_VMX_ENTRY_CTLS, IA32_VMX_EPT_VPID_CAP, IA32_VMX_EXIT_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS, IA32_VMX_PROCBASED_CTLS2, IA32_VMX_VMFUNC};
+use x86::controlregs::{self, cr0_write, cr3, Cr0};
+use x86::cpuid::CpuId;
+use x86::msr::{self, IA32_PAT, IA32_VMX_BASIC, IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1, IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1, IA32_VMX_ENTRY_CTLS, IA32_VMX_EPT_VPID_CAP, IA32_VMX_EXIT_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS, IA32_VMX_PROCBASED_CTLS2, IA32_VMX_TRUE_ENTRY_CTLS, IA32_VMX_TRUE_EXIT_CTLS, IA32_VMX_TRUE_PINBASED_CTLS, IA32_VMX_TRUE_PROCBASED_CTLS, IA32_VMX_VMFUNC};
 use x86::segmentation::{cs, ds, es, fs, gs, ss};
 use x86::task::tr;
+use x86::vmx::vmcs::control::{EntryControls, ExitControls, PinbasedControls, PrimaryControls, SecondaryControls};
 use x86::vmx::{vmcs, VmFail};
 use x86::{controlregs::{cr0, cr4, cr4_write, Cr4}, cpuid::cpuid, msr::rdmsr};
 use x86_64::instructions::tables::{sgdt, sidt};
@@ -15,31 +18,214 @@ use x86_64::registers::control::Efer;
 use crate::arch::amd64::descriptors::TSS;
 use crate::arch::cpu;
 use crate::arch::cpu::mm::Freelist;
-use crate::println;
+use crate::{print, println};
+
+use super::mm::MEMORY_MAP_REQUEST;
+
+pub fn has_intel_cpu() -> bool {
+    let cpuid = CpuId::new();
+    if let Some(vi) = cpuid.get_vendor_info() {
+        if vi.as_str() == "GenuineIntel" {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn has_vmx_support() -> bool {
+    let cpuid = CpuId::new();
+    if let Some(fi) = cpuid.get_feature_info() {
+        if fi.has_vmx() {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn enable_vmx_operation() -> bool {
+    let mut cr4 = unsafe { controlregs::cr4() };
+    cr4.set(controlregs::Cr4::CR4_ENABLE_VMX, true);
+    unsafe { controlregs::cr4_write(cr4) };
+
+    assert!(set_lock_bit());
+    println!("[+] Lock bit set via IA32_FEATURE_CONTROL");
+
+    true
+}
+
+fn set_lock_bit() -> bool {
+    const VMX_LOCK_BIT: u64 = 1 << 0;
+    const VMXON_OUTSIDE_SMX: u64 = 1 << 2;
+
+    let ia32_feature_control = unsafe { rdmsr(msr::IA32_FEATURE_CONTROL) };
+
+    if (ia32_feature_control & VMX_LOCK_BIT) == 0 {
+        unsafe {
+            msr::wrmsr(
+                msr::IA32_FEATURE_CONTROL,
+                VMXON_OUTSIDE_SMX | VMX_LOCK_BIT | ia32_feature_control,
+            )
+        };
+    } else if (ia32_feature_control & VMXON_OUTSIDE_SMX) == 0 {
+        return false
+    }
+
+    true
+}
+
+pub fn adjust_control_registers() {
+    set_cr0_bits();
+    println!("[+] Mandatory bits in CR0 set/cleared");
+
+    set_cr4_bits();
+    println!("[+] Mandatory bits in CR4 set/cleared");
+}
+
+/// Set the mandatory bits in CR0 and clear bits that are mandatory zero (Intel Manual: 24.8 Restrictions on VMX Operation)
+fn set_cr0_bits() {
+    let ia32_vmx_cr0_fixed0 = unsafe { msr::rdmsr(msr::IA32_VMX_CR0_FIXED0) };
+    let ia32_vmx_cr0_fixed1 = unsafe { msr::rdmsr(msr::IA32_VMX_CR0_FIXED1) };
+
+    let mut cr0 = unsafe { controlregs::cr0() };
+
+    cr0 |= controlregs::Cr0::from_bits_truncate(ia32_vmx_cr0_fixed0 as usize);
+    cr0 &= controlregs::Cr0::from_bits_truncate(ia32_vmx_cr0_fixed1 as usize);
+
+    unsafe { controlregs::cr0_write(cr0) };
+}
+
+/// Set the mandatory bits in CR4 and clear bits that are mandatory zero (Intel Manual: 24.8 Restrictions on VMX Operation)
+fn set_cr4_bits() {
+    let ia32_vmx_cr4_fixed0 = unsafe { msr::rdmsr(msr::IA32_VMX_CR4_FIXED0) };
+    let ia32_vmx_cr4_fixed1 = unsafe { msr::rdmsr(msr::IA32_VMX_CR4_FIXED1) };
+
+    let mut cr4 = unsafe { controlregs::cr4() };
+
+    cr4 |= controlregs::Cr4::from_bits_truncate(ia32_vmx_cr4_fixed0 as usize);
+    cr4 &= controlregs::Cr4::from_bits_truncate(ia32_vmx_cr4_fixed1 as usize);
+
+    unsafe { controlregs::cr4_write(cr4) };
+}
+
+#[repr(C, align(4096))]
+pub struct VmxonRegion {
+    pub revision_id: u32,
+    pub data: [u8; PAGE_SIZE - 4],
+}
+const PAGE_SIZE: usize = 0x1000;
+
+pub fn get_vmcs_revision_id() -> u32 {
+    unsafe { (msr::rdmsr(msr::IA32_VMX_BASIC) as u32) & 0x7FFF_FFFF }
+}
+
+pub unsafe fn has_unrestricted_guest() -> bool {
+    msr::rdmsr(msr::IA32_VMX_PROCBASED_CTLS2) & (1<<39) != 0
+}
+
+pub unsafe fn setup_ept(eptp: u64) {
+    for entry in MEMORY_MAP_REQUEST.get_response().unwrap().entries() {
+        if entry.entry_type == EntryType::USABLE || entry.entry_type == EntryType::BAD_MEMORY {
+            continue;
+        }
+        let ept4 = eptp as *mut u64;
+        let mut current_page = entry.base;
+        while current_page < entry.base + entry.length {
+            // if we are 1GB aligned and 1GB size
+            if current_page & 0x3FFFFFFF == 0 && entry.length - (current_page - entry.base) >= 512*512*4096 {
+                let ept4i = ((current_page >> 39) & 0x1FF) as usize;
+                let ept4e = *ept4.add(ept4i);
+                if ept4e == 0 {
+                    let page = Freelist::alloc::<[u8;4096]>();
+                    (*page).fill(0);
+                    *ept4.add(ept4i) = 7 | page as u64;
+                }
+                let ept3 = (*ept4.add(ept4i) & !0xFFF) as *mut u64;
+                let ept3i = ((current_page >> 30) & 0x1FF) as usize;
+                *ept3.add(ept3i) = 7 | (1<<7) | current_page;
+                current_page += 512*512*4096;
+            }
+            // if we are 2MB aligned and 2MB size
+            else if current_page & 0x1FFFFF == 0 && entry.length - (current_page - entry.base) >= 512*4096 {
+                let ept4i = ((current_page >> 39) & 0x1FF) as usize;
+                let ept4e = *ept4.add(ept4i);
+                if ept4e == 0 {
+                    let page = Freelist::alloc::<[u8;4096]>();
+                    (*page).fill(0);
+                    *ept4.add(ept4i) = 7 | page as u64;
+                }
+                let ept3 = (*ept4.add(ept4i) & !0xFFF) as *mut u64;
+                let ept3i = ((current_page >> 30) & 0x1FF) as usize;
+                let ept3e = *ept3.add(ept3i);
+                if ept3e == 0 {
+                    let page = Freelist::alloc::<[u8;4096]>();
+                    (*page).fill(0);
+                    *ept3.add(ept3i) = 7 | page as u64;
+                }
+                let ept2 = (*ept3.add(ept3i) & !0xFFF) as *mut u64;
+                let ept2i = ((current_page >> 21) & 0x1FF) as usize;
+                *ept2.add(ept2i) = 7 | (1<<7) | current_page;
+                current_page += 512*4096;
+            } else {
+                let ept4i = ((current_page >> 39) & 0x1FF) as usize;
+                let ept4e = *ept4.add(ept4i);
+                if ept4e == 0 {
+                    let page = Freelist::alloc::<[u8;4096]>();
+                    (*page).fill(0);
+                    *ept4.add(ept4i) = 7 | page as u64;
+                }
+                let ept3 = (*ept4.add(ept4i) & !0xFFF) as *mut u64;
+                let ept3i = ((current_page >> 30) & 0x1FF) as usize;
+                let ept3e = *ept3.add(ept3i);
+                if ept3e == 0 {
+                    let page = Freelist::alloc::<[u8;4096]>();
+                    (*page).fill(0);
+                    *ept3.add(ept3i) = 7 | page as u64;
+                }
+                let ept2 = (*ept3.add(ept3i) & !0xFFF) as *mut u64;
+                let ept2i = ((current_page >> 21) & 0x1FF) as usize;
+                let ept2e = *ept2.add(ept2i);
+                if ept2e == 0 {
+                    let page = Freelist::alloc::<[u8;4096]>();
+                    (*page).fill(0);
+                    *ept2.add(ept2i) = 7 | page as u64;
+                }
+                let ept1 = (*ept2.add(ept2i) & !0xFFF) as *mut u64;
+                let ept1i = ((current_page >> 12) & 0x1FF) as usize;
+                *ept1.add(ept1i) = 7 | current_page;
+                current_page += 4096;
+            }
+        }
+    }
+}
 
 pub unsafe fn init() {
-    assert!(cpuid!(1).ecx & (1<<5) != 0, "vmx not supported");
-    unsafe { cr4_write(cr4() | Cr4::CR4_ENABLE_VMX) }
-    let vmcs_revision_id = rdmsr(IA32_VMX_BASIC);
+    assert!(has_intel_cpu(), "not an Intel CPU");
+    assert!(has_vmx_support(), "VMX not supported");
+    assert!(enable_vmx_operation(), "failed to enable VMX");
+    assert!(has_unrestricted_guest(), "missing crucial CPU feature (unrestricted guest)");
     
     println!("starting vm...");
 
-    cr0_write(Cr0::from_bits_unchecked((cr0().bits() as u64 | rdmsr(IA32_VMX_CR0_FIXED0)) as usize));
-    cr4_write(Cr4::from_bits_unchecked((cr4().bits() as u64 | rdmsr(IA32_VMX_CR4_FIXED0)) as usize));
+    adjust_control_registers();
 
-    let vmcs_root = Freelist::alloc::<u32>() as u64;
-    let vmcs_guest = Freelist::alloc::<u32>() as u64;
-    let guest_pml4 = Freelist::alloc::<u64>() as u64;
+    let vmcs_revision_id = get_vmcs_revision_id();
 
-    println!("{vmcs_root:x} {vmcs_guest:x} {vmcs_revision_id:x}");
-    *(vmcs_root as *mut u32) = vmcs_revision_id as u32;
-    *(vmcs_guest as *mut u32) = vmcs_revision_id as u32;
+    let vmcs_root = Freelist::alloc::<VmxonRegion>();
+    let vmcs_guest = Freelist::alloc::<VmxonRegion>();
+    let guest_eptp = Freelist::alloc::<u64>() as u64;
+    (*(guest_eptp as *mut [u8;4096])).fill(0);
+    (*(vmcs_guest as *mut [u8;4096])).fill(0);
+
+    setup_ept(guest_eptp);
+    (*vmcs_root).revision_id = vmcs_revision_id;
+    (*vmcs_guest).revision_id = vmcs_revision_id;
+
     println!("vmxon?");
-    vmxon(vmcs_root).expect("vmxon failed");
+    vmxon(vmcs_root as u64).expect("vmxon failed");
     println!("vmclear?");
-    vmclear(vmcs_guest).expect("vmclear failed");
+    vmclear(vmcs_guest as u64).expect("vmclear failed");
     println!("vmptrld?");
-    vmptrld(vmcs_guest).expect("vmptrld failed");
+    vmptrld(vmcs_guest as u64).expect("vmptrld failed");
 
     vmwrite(vmcs::host::CR3, cr3());
     vmwrite(vmcs::host::CR0, cr0().bits() as u64);
@@ -49,15 +235,13 @@ pub unsafe fn init() {
     vmwrite(vmcs::host::GDTR_BASE, sgdt().base.as_u64());
     vmwrite(vmcs::host::IDTR_BASE, sidt().base.as_u64());
     vmwrite(vmcs::host::TR_BASE, addr_of!(TSS) as u64);
-    vmwrite(vmcs::host::TR_SELECTOR, (tr().bits() & 0xF8) as u64);
-    vmwrite(vmcs::host::CS_SELECTOR, cs().bits() as u64);
-    vmwrite(vmcs::host::DS_SELECTOR, ds().bits() as u64);
-    vmwrite(vmcs::host::ES_SELECTOR, es().bits() as u64);
-    vmwrite(vmcs::host::FS_SELECTOR, fs().bits() as u64);
-    vmwrite(vmcs::host::GS_SELECTOR, gs().bits() as u64);
-    vmwrite(vmcs::host::SS_SELECTOR, ss().bits() as u64);
-    vmwrite(vmcs::host::IA32_EFER_FULL, Efer::read_raw());
-    vmwrite(vmcs::host::IA32_PAT_FULL, rdmsr(IA32_PAT));
+    vmwrite(vmcs::host::TR_SELECTOR, 0x18);
+    vmwrite(vmcs::host::CS_SELECTOR, 0x08);
+    vmwrite(vmcs::host::DS_SELECTOR, 0);
+    vmwrite(vmcs::host::ES_SELECTOR, 0);
+    vmwrite(vmcs::host::FS_SELECTOR, 0);
+    vmwrite(vmcs::host::GS_SELECTOR, 0);
+    vmwrite(vmcs::host::SS_SELECTOR, 0);
 
     vmwrite(vmcs::host::IA32_SYSENTER_CS, 0);
     vmwrite(vmcs::host::IA32_SYSENTER_EIP, 0);
@@ -65,33 +249,38 @@ pub unsafe fn init() {
     vmwrite(vmcs::host::FS_BASE, 0);
     vmwrite(vmcs::host::GS_BASE, 0);
     vmwrite(vmcs::control::VMENTRY_CONTROLS, {
-        let mut adjust = 1<<2;
-        adjust &= rdmsr(IA32_VMX_ENTRY_CTLS) >> 32;
-        adjust |= rdmsr(IA32_VMX_ENTRY_CTLS) & 0xFFFFFFFF;
+        let mut adjust = 0 as u64;
+        let bits = msr::rdmsr(IA32_VMX_ENTRY_CTLS);
+        adjust &= bits >> 32;
+        adjust |= bits & 0xFFFFFFFF;
         adjust
     });
     vmwrite(vmcs::control::PINBASED_EXEC_CONTROLS,{
-        let mut adjust = 1;
-        adjust &= rdmsr(IA32_VMX_PINBASED_CTLS) >> 32;
-        adjust |= rdmsr(IA32_VMX_PINBASED_CTLS) & 0xFFFFFFFF;
+        let mut adjust = 0;
+        let bits = msr::rdmsr(IA32_VMX_PINBASED_CTLS);
+        adjust &= bits >> 32;
+        adjust |= bits & 0xFFFFFFFF;
         adjust
     });
     vmwrite(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS,{
-        let mut adjust = 3<<15 | 1<<31;
-        adjust &= rdmsr(IA32_VMX_PROCBASED_CTLS) >> 32;
-        adjust |= rdmsr(IA32_VMX_PROCBASED_CTLS) & 0xFFFFFFFF;
+        let mut adjust = (PrimaryControls::SECONDARY_CONTROLS).bits() as u64;
+        let bits = msr::rdmsr(IA32_VMX_PROCBASED_CTLS);
+        adjust &= bits >> 32;
+        adjust |= bits & 0xFFFFFFFF;
         adjust
     });
     vmwrite(vmcs::control::SECONDARY_PROCBASED_EXEC_CONTROLS,{
-        let mut adjust = 1<<1|1<<7;
-        adjust &= rdmsr(IA32_VMX_PROCBASED_CTLS2) >> 32;
-        adjust |= rdmsr(IA32_VMX_PROCBASED_CTLS2) & 0xFFFFFFFF;
+        let mut adjust = (SecondaryControls::ENABLE_EPT | SecondaryControls::UNRESTRICTED_GUEST).bits() as u64;
+        let bits = msr::rdmsr(IA32_VMX_PROCBASED_CTLS2);
+        adjust &= bits >> 32;
+        adjust |= bits & 0xFFFFFFFF;
         adjust
     });
     vmwrite(vmcs::control::VMEXIT_CONTROLS, {
-        let mut adjust = 1<<2;
-        adjust &= rdmsr(IA32_VMX_EXIT_CTLS) >> 32;
-        adjust |= rdmsr(IA32_VMX_EXIT_CTLS) & 0xFFFFFFFF;
+        let mut adjust = ExitControls::HOST_ADDRESS_SPACE_SIZE.bits() as u64;
+        let bits = msr::rdmsr(IA32_VMX_EXIT_CTLS);
+        adjust &= bits >> 32;
+        adjust |= bits & 0xFFFFFFFF;
         adjust
     });
     vmwrite(vmcs::guest::LINK_PTR_FULL, 0xFFFFFFFFFFFFFFFF);
@@ -105,9 +294,9 @@ pub unsafe fn init() {
     vmwrite(vmcs::guest::IDTR_BASE, 0);
     vmwrite(vmcs::guest::IDTR_LIMIT, 0);
     vmwrite(vmcs::guest::CS_ACCESS_RIGHTS, 3 | (1<<4) | (1<<7));
-    vmwrite(vmcs::guest::CS_BASE, 0);
+    vmwrite(vmcs::guest::CS_BASE, 0xFFFF0000);
     vmwrite(vmcs::guest::CS_LIMIT, 0xFFFF);
-    vmwrite(vmcs::guest::CS_SELECTOR, 0);
+    vmwrite(vmcs::guest::CS_SELECTOR, 0xF000);
     vmwrite(vmcs::guest::DS_ACCESS_RIGHTS, 3 | (1<<4) | (1<<7));
     vmwrite(vmcs::guest::DS_BASE, 0);
     vmwrite(vmcs::guest::DS_LIMIT, 0xFFFF);
@@ -138,45 +327,13 @@ pub unsafe fn init() {
     vmwrite(vmcs::guest::TR_SELECTOR, 0);
     vmwrite(vmcs::guest::DR7, 0);
     vmwrite(vmcs::guest::RSP, 0);
+    vmwrite(vmcs::guest::RIP, 0xFFF0);
     vmwrite(vmcs::guest::RFLAGS, 2);
     vmwrite(vmcs::guest::IA32_SYSENTER_CS, 0);
     vmwrite(vmcs::guest::IA32_SYSENTER_EIP, 0);
     vmwrite(vmcs::guest::IA32_SYSENTER_ESP, 0);
-    vmwrite(vmcs::control::EPTP_FULL, guest_pml4);
 
-    println!("MSR_IA32_VMX_PINBASED_CTLS {:x}",rdmsr(IA32_VMX_PINBASED_CTLS));
-    println!("MSR_IA32_VMX_PROCBASED_CTLS {:x}",rdmsr(IA32_VMX_PROCBASED_CTLS));
-    println!("MSR_IA32_VMX_PROCBASED_CTLS2 {:x}",rdmsr(IA32_VMX_PROCBASED_CTLS2));
-    println!("MSR_IA32_VMX_EXIT_CTLS {:x}",rdmsr(IA32_VMX_EXIT_CTLS));
-    println!("MSR_IA32_VMX_ENTRY_CTLS {:x}",rdmsr(IA32_VMX_ENTRY_CTLS));
-    println!("MSR_IA32_VMX_EPT_VPID_CAP {:x}",rdmsr(IA32_VMX_EPT_VPID_CAP));
-    println!("MSR_IA32_VMX_VMFUNC {:x}",rdmsr(IA32_VMX_VMFUNC));
-    println!("MSR_IA32_CR0_FIXED0 {:x}",rdmsr(IA32_VMX_CR0_FIXED0));
-    println!("MSR_IA32_CR0_FIXED1 {:x}",rdmsr(IA32_VMX_CR0_FIXED1));
-    println!("MSR_IA32_CR4_FIXED0 {:x}",rdmsr(IA32_VMX_CR4_FIXED0));
-    println!("MSR_IA32_CR4_FIXED1 {:x}",rdmsr(IA32_VMX_CR4_FIXED1));
-    println!();
-    println!("host cr0 {:x}",cr0());
-    println!("host cr3 {:x}",cr3());
-    println!("host cr4 {:x}",cr4());
-    println!("host efer {:x}", Efer::read_raw());
-    println!("host fs_base {:x}", 0);
-    println!("host gdtr_base {:x}", sgdt().base.as_u64());
-    println!("host gs_base {:x}", 0);
-    println!("host idtr_base {:x}", sidt().base.as_u64());
-    println!("host pat {:x}", rdmsr(IA32_PAT));
-    println!("host rip {:x}", vmexit_handler as u64);
-    println!("host rsp {:x}", rsp() - 0x80);
-    println!("host cs {:x}", cs());
-    println!("host ds {:x}", ds());
-    println!("host es {:x}", es());
-    println!("host fs {:x}", fs());
-    println!("host gs {:x}", gs());
-    println!("host ss {:x}", ss());
-    println!("host cs_se {:x}", 0);
-    println!("host eip_se {:x}", 0);
-    println!("host esp_se {:x}", 0);
-    println!("host tr_base {:x}", addr_of!(TSS) as u64);
+    vmwrite(vmcs::control::EPTP_FULL, guest_eptp | (3<<3));
 
     match vmlaunch() {
         Ok(()) => {},
@@ -191,5 +348,11 @@ pub unsafe fn init() {
 
 unsafe fn vmexit_handler() {
     println!("vmexit");
-    vmresume().expect("vmresume failed");
+    match vmresume() {
+        Ok(()) => {},
+        Err(_) => {
+            let error = vmread(vmcs::ro::VM_INSTRUCTION_ERROR).expect("failed to read error code");
+            panic!("vmresume failed ({error})");
+        },
+    }
 }

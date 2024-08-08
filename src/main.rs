@@ -2,8 +2,7 @@
 #![no_std]
 #![no_main]
 
-use arch::amd64::wait_forever;
-use x86::bits64::vmx::vmptrst;
+use arch::cpu;
 
 mod gfx;
 mod terminal;
@@ -11,7 +10,7 @@ mod arch;
 
 #[no_mangle]
 unsafe extern "C" fn _start() -> ! {
-    arch::cpu::init();
+    cpu::init();
     gfx::framebuffer_init();
     println!("Starting up...");
     if let Some(framebuffer) = gfx::FRAMEBUFFER.lock().as_ref() {
@@ -25,9 +24,9 @@ unsafe extern "C" fn _start() -> ! {
         framebuffer.line(256, 256, 320, 384, 0xFF808080);
         framebuffer.line(256, 256, 384, 320, 0xFF808080);
     }
-    arch::cpu::vmx::init();
+    cpu::vmx::init();
 
-    wait_forever()
+    cpu::wait_forever()
 }
 
 #[panic_handler]
@@ -43,12 +42,5 @@ fn rust_panic(info: &core::panic::PanicInfo) -> ! {
         framebuffer.line(framebuffer.width/2-91, framebuffer.height/2-89,framebuffer.width/2+89, framebuffer.height/2+91, 0xFF808080);
         framebuffer.line(framebuffer.width/2-89, framebuffer.height/2-91,framebuffer.width/2+91, framebuffer.height/2+89, 0xFF808080);
     }
-    hcf();
-}
-
-fn hcf() -> ! {
-    x86_64::instructions::interrupts::disable();
-    loop {
-        x86_64::instructions::hlt();
-    }
+    cpu::halt_forever()
 }

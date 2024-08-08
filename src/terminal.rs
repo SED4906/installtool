@@ -10,9 +10,9 @@ impl fmt::Write for Writer {
                 0,
                 0,
                 s,
-                Some(framebuffer.width / 16),
+                Some(framebuffer.width / 8),
                 Some(*col),
-                Some(framebuffer.height / 16),
+                Some(framebuffer.height / 8),
                 Some(*row),
                 0xFFFFFFFF,
             );

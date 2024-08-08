@@ -1,6 +1,6 @@
 use spin::Mutex;
 use x86_64::instructions::tables::load_tss;
-use x86_64::registers::segmentation::{Segment, SegmentSelector, CS, SS};
+use x86_64::registers::segmentation::{Segment, SegmentSelector, CS, DS, SS};
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::structures::tss::TaskStateSegment;
@@ -15,15 +15,12 @@ pub static IDT: Mutex<InterruptDescriptorTable> = Mutex::new(InterruptDescriptor
 pub fn init() {
     let mut gdt = GDT.lock();
     gdt.append(Descriptor::kernel_code_segment());
-    gdt.append(Descriptor::user_code_segment());
     gdt.append(Descriptor::kernel_data_segment());
-    gdt.append(Descriptor::user_data_segment());
     gdt.append(Descriptor::tss_segment(&TSS));
     unsafe {
         gdt.load_unsafe();
         CS::set_reg(SegmentSelector::new(1, Ring0));
-        SS::set_reg(SegmentSelector::new(3, Ring0));
-        load_tss(SegmentSelector::new(5, Ring0));
+        load_tss(SegmentSelector::new(3, Ring0));
     }
     let mut idt = IDT.lock();
     idt.divide_error

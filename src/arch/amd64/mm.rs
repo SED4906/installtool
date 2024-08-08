@@ -5,7 +5,7 @@ use limine::{
     request::{HhdmRequest, MemoryMapRequest},
 };
 use spin::Mutex;
-static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+pub static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 const PAGE_SIZE: usize = 4096;

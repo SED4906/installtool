@@ -14,7 +14,7 @@ pub fn framebuffer_init() {
         let response = &framebuffer_response
             .framebuffers()
             .next()
-            .unwrap_or_else(|| crate::hcf());
+            .unwrap_or_else(|| crate::cpu::halt_forever());
         let mut framebuffer = FRAMEBUFFER.lock();
         *framebuffer = Some(Framebuffer {
             address: response.addr() as *mut u32,
@@ -23,7 +23,7 @@ pub fn framebuffer_init() {
             height: response.height() as usize,
         });
     } else {
-        crate::hcf()
+        crate::cpu::halt_forever()
     }
 }
 
