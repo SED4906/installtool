@@ -122,78 +122,108 @@ pub unsafe fn has_unrestricted_guest() -> bool {
     msr::rdmsr(msr::IA32_VMX_PROCBASED_CTLS2) & (1<<39) != 0
 }
 
+pub unsafe fn map_ept_page_4kb(eptp: u64, page: u64, guest: u64) {
+    let ept4 = eptp as *mut u64;
+    let ept4i = ((guest >> 39) & 0x1FF) as usize;
+    let ept4e = *ept4.add(ept4i);
+    if ept4e == 0 {
+        let page = Freelist::alloc::<[u8;4096]>();
+        (*page).fill(0);
+        *ept4.add(ept4i) = 7 | page as u64;
+    }
+    let ept3 = (*ept4.add(ept4i) & !0xFFF) as *mut u64;
+    let ept3i = ((guest >> 30) & 0x1FF) as usize;
+    let ept3e = *ept3.add(ept3i);
+    if ept3e == 0 {
+        let page = Freelist::alloc::<[u8;4096]>();
+        (*page).fill(0);
+        *ept3.add(ept3i) = 7 | page as u64;
+    }
+    let ept2 = (*ept3.add(ept3i) & !0xFFF) as *mut u64;
+    let ept2i = ((guest >> 21) & 0x1FF) as usize;
+    let ept2e = *ept2.add(ept2i);
+    if ept2e == 0 {
+        let page = Freelist::alloc::<[u8;4096]>();
+        (*page).fill(0);
+        *ept2.add(ept2i) = 7 | page as u64;
+    }
+    let ept1 = (*ept2.add(ept2i) & !0xFFF) as *mut u64;
+    let ept1i = ((guest >> 12) & 0x1FF) as usize;
+    *ept1.add(ept1i) = 7 | page;
+}
+
+pub unsafe fn map_ept_page_2mb(eptp: u64, page: u64, guest: u64) {
+    let ept4 = eptp as *mut u64;
+    let ept4i = ((guest >> 39) & 0x1FF) as usize;
+    let ept4e = *ept4.add(ept4i);
+    if ept4e == 0 {
+        let page = Freelist::alloc::<[u8;4096]>();
+        (*page).fill(0);
+        *ept4.add(ept4i) = 7 | page as u64;
+    }
+    let ept3 = (*ept4.add(ept4i) & !0xFFF) as *mut u64;
+    let ept3i = ((guest >> 30) & 0x1FF) as usize;
+    let ept3e = *ept3.add(ept3i);
+    if ept3e == 0 {
+        let page = Freelist::alloc::<[u8;4096]>();
+        (*page).fill(0);
+        *ept3.add(ept3i) = 7 | page as u64;
+    }
+    let ept2 = (*ept3.add(ept3i) & !0xFFF) as *mut u64;
+    let ept2i = ((guest >> 21) & 0x1FF) as usize;
+    *ept2.add(ept2i) = 7 | (1<<7) | page;
+}
+
+pub unsafe fn map_ept_page_1gb(eptp: u64, page: u64, guest: u64) {
+    let ept4 = eptp as *mut u64;
+    let ept4i = ((guest >> 39) & 0x1FF) as usize;
+    let ept4e = *ept4.add(ept4i);
+    if ept4e == 0 {
+        let page = Freelist::alloc::<[u8;4096]>();
+        (*page).fill(0);
+        *ept4.add(ept4i) = 7 | page as u64;
+    }
+    let ept3 = (*ept4.add(ept4i) & !0xFFF) as *mut u64;
+    let ept3i = ((guest >> 30) & 0x1FF) as usize;
+    *ept3.add(ept3i) = 7 | (1<<7) | page;
+}
+
+
 pub unsafe fn setup_ept(eptp: u64) {
     for entry in MEMORY_MAP_REQUEST.get_response().unwrap().entries() {
         if entry.entry_type == EntryType::USABLE || entry.entry_type == EntryType::BAD_MEMORY {
             continue;
         }
-        let ept4 = eptp as *mut u64;
+        
         let mut current_page = entry.base;
         while current_page < entry.base + entry.length {
             // if we are 1GB aligned and 1GB size
             if current_page & 0x3FFFFFFF == 0 && entry.length - (current_page - entry.base) >= 512*512*4096 {
-                let ept4i = ((current_page >> 39) & 0x1FF) as usize;
-                let ept4e = *ept4.add(ept4i);
-                if ept4e == 0 {
-                    let page = Freelist::alloc::<[u8;4096]>();
-                    (*page).fill(0);
-                    *ept4.add(ept4i) = 7 | page as u64;
-                }
-                let ept3 = (*ept4.add(ept4i) & !0xFFF) as *mut u64;
-                let ept3i = ((current_page >> 30) & 0x1FF) as usize;
-                *ept3.add(ept3i) = 7 | (1<<7) | current_page;
+                map_ept_page_1gb(eptp, current_page, current_page);
                 current_page += 512*512*4096;
             }
             // if we are 2MB aligned and 2MB size
             else if current_page & 0x1FFFFF == 0 && entry.length - (current_page - entry.base) >= 512*4096 {
-                let ept4i = ((current_page >> 39) & 0x1FF) as usize;
-                let ept4e = *ept4.add(ept4i);
-                if ept4e == 0 {
-                    let page = Freelist::alloc::<[u8;4096]>();
-                    (*page).fill(0);
-                    *ept4.add(ept4i) = 7 | page as u64;
-                }
-                let ept3 = (*ept4.add(ept4i) & !0xFFF) as *mut u64;
-                let ept3i = ((current_page >> 30) & 0x1FF) as usize;
-                let ept3e = *ept3.add(ept3i);
-                if ept3e == 0 {
-                    let page = Freelist::alloc::<[u8;4096]>();
-                    (*page).fill(0);
-                    *ept3.add(ept3i) = 7 | page as u64;
-                }
-                let ept2 = (*ept3.add(ept3i) & !0xFFF) as *mut u64;
-                let ept2i = ((current_page >> 21) & 0x1FF) as usize;
-                *ept2.add(ept2i) = 7 | (1<<7) | current_page;
+                map_ept_page_2mb(eptp, current_page, current_page);
                 current_page += 512*4096;
             } else {
-                let ept4i = ((current_page >> 39) & 0x1FF) as usize;
-                let ept4e = *ept4.add(ept4i);
-                if ept4e == 0 {
-                    let page = Freelist::alloc::<[u8;4096]>();
-                    (*page).fill(0);
-                    *ept4.add(ept4i) = 7 | page as u64;
-                }
-                let ept3 = (*ept4.add(ept4i) & !0xFFF) as *mut u64;
-                let ept3i = ((current_page >> 30) & 0x1FF) as usize;
-                let ept3e = *ept3.add(ept3i);
-                if ept3e == 0 {
-                    let page = Freelist::alloc::<[u8;4096]>();
-                    (*page).fill(0);
-                    *ept3.add(ept3i) = 7 | page as u64;
-                }
-                let ept2 = (*ept3.add(ept3i) & !0xFFF) as *mut u64;
-                let ept2i = ((current_page >> 21) & 0x1FF) as usize;
-                let ept2e = *ept2.add(ept2i);
-                if ept2e == 0 {
-                    let page = Freelist::alloc::<[u8;4096]>();
-                    (*page).fill(0);
-                    *ept2.add(ept2i) = 7 | page as u64;
-                }
-                let ept1 = (*ept2.add(ept2i) & !0xFFF) as *mut u64;
-                let ept1i = ((current_page >> 12) & 0x1FF) as usize;
-                *ept1.add(ept1i) = 7 | current_page;
+                map_ept_page_4kb(eptp, current_page, current_page);
                 current_page += 4096;
             }
+        }
+    }
+    map_ept_page_4kb(eptp, 0, 0);
+    'exhaust: for entry in MEMORY_MAP_REQUEST.get_response().unwrap().entries() {
+        if entry.entry_type != EntryType::USABLE {
+            continue;
+        }
+        
+        let mut current_page = entry.base;
+        while current_page < entry.base + entry.length {
+            let page = Freelist::alloc::<u8>() as u64;
+            if page == 0 {break 'exhaust};
+            map_ept_page_4kb(eptp, page, current_page);
+            current_page += 4096;
         }
     }
 }
@@ -286,8 +316,14 @@ pub unsafe fn init() {
     vmwrite(vmcs::guest::LINK_PTR_FULL, 0xFFFFFFFFFFFFFFFF);
     //vmwrite(vmcs::control::EXCEPTION_BITMAP, 0xFFFFFFFF);
 
-    vmwrite(vmcs::guest::CR0, 0x60000010);
-    vmwrite(vmcs::guest::CR4, 0);
+    let ia32_vmx_cr0_fixed0 = unsafe { msr::rdmsr(msr::IA32_VMX_CR0_FIXED0) };
+    let ia32_vmx_cr0_fixed1 = unsafe { msr::rdmsr(msr::IA32_VMX_CR0_FIXED1) };
+    let ia32_vmx_cr4_fixed0 = unsafe { msr::rdmsr(msr::IA32_VMX_CR4_FIXED0) };
+    let guest_cr0 = (0x60000010 | ia32_vmx_cr0_fixed0) & ia32_vmx_cr0_fixed1;
+    let guest_cr4 = ia32_vmx_cr4_fixed0;
+
+    vmwrite(vmcs::guest::CR0, guest_cr0 & !(1<<1 | 1<<31));
+    vmwrite(vmcs::guest::CR4, guest_cr4);
     vmwrite(vmcs::guest::CR3, 0);
     vmwrite(vmcs::guest::GDTR_BASE, 0);
     vmwrite(vmcs::guest::GDTR_LIMIT, 0);
@@ -347,7 +383,16 @@ pub unsafe fn init() {
 }
 
 unsafe fn vmexit_handler() {
-    println!("vmexit");
+    let exit_reason = vmread(vmcs::ro::EXIT_REASON).expect("failed to get exit reason");
+    print!("vmexit ({exit_reason:x}) ");
+    if exit_reason == 48 {
+        let ept_violation_addr = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL).expect("failed to get EPT violation guest address");
+        print!("{ept_violation_addr:x}");
+    }
+    println!();
+    if exit_reason == 2 {
+        panic!("guest system died of death");
+    }
     match vmresume() {
         Ok(()) => {},
         Err(_) => {
