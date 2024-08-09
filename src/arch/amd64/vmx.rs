@@ -4,16 +4,13 @@ use limine::memory_map::EntryType;
 use x86::bits64::registers::rsp;
 use x86::bits64::vmx::{vmclear, vmlaunch, vmptrld, vmread, vmresume, vmwrite, vmxon};
 
-use x86::controlregs::{self, cr0_write, cr3, Cr0};
+use x86::controlregs::{self, cr3};
 use x86::cpuid::CpuId;
-use x86::msr::{self, IA32_PAT, IA32_VMX_BASIC, IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1, IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1, IA32_VMX_ENTRY_CTLS, IA32_VMX_EPT_VPID_CAP, IA32_VMX_EXIT_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS, IA32_VMX_PROCBASED_CTLS2, IA32_VMX_TRUE_ENTRY_CTLS, IA32_VMX_TRUE_EXIT_CTLS, IA32_VMX_TRUE_PINBASED_CTLS, IA32_VMX_TRUE_PROCBASED_CTLS, IA32_VMX_VMFUNC};
-use x86::segmentation::{cs, ds, es, fs, gs, ss};
-use x86::task::tr;
-use x86::vmx::vmcs::control::{EntryControls, ExitControls, PinbasedControls, PrimaryControls, SecondaryControls};
-use x86::vmx::{vmcs, VmFail};
-use x86::{controlregs::{cr0, cr4, cr4_write, Cr4}, cpuid::cpuid, msr::rdmsr};
+use x86::msr::{self, IA32_VMX_ENTRY_CTLS, IA32_VMX_EXIT_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS, IA32_VMX_PROCBASED_CTLS2};
+use x86::vmx::vmcs::control::{ExitControls, PrimaryControls, SecondaryControls};
+use x86::vmx::vmcs;
+use x86::{controlregs::{cr0, cr4}, msr::rdmsr};
 use x86_64::instructions::tables::{sgdt, sidt};
-use x86_64::registers::control::Efer;
 
 use crate::arch::amd64::descriptors::TSS;
 use crate::arch::cpu;
@@ -226,6 +223,7 @@ pub unsafe fn setup_ept(eptp: u64) {
             current_page += 4096;
         }
     }
+    map_ept_page_4kb(eptp, 0xfffff000, 0xff000);
 }
 
 pub unsafe fn init() {
@@ -293,7 +291,7 @@ pub unsafe fn init() {
         adjust
     });
     vmwrite(vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS,{
-        let mut adjust = (PrimaryControls::SECONDARY_CONTROLS).bits() as u64;
+        let mut adjust = (PrimaryControls::USE_MSR_BITMAPS | PrimaryControls::SECONDARY_CONTROLS).bits() as u64;
         let bits = msr::rdmsr(IA32_VMX_PROCBASED_CTLS);
         adjust &= bits >> 32;
         adjust |= bits & 0xFFFFFFFF;
@@ -322,14 +320,14 @@ pub unsafe fn init() {
     let guest_cr0 = (0x60000010 | ia32_vmx_cr0_fixed0) & ia32_vmx_cr0_fixed1;
     let guest_cr4 = ia32_vmx_cr4_fixed0;
 
-    vmwrite(vmcs::guest::CR0, guest_cr0 & !(1<<1 | 1<<31));
+    vmwrite(vmcs::guest::CR0, guest_cr0 & !(1<<0 | 1<<31));
     vmwrite(vmcs::guest::CR4, guest_cr4);
     vmwrite(vmcs::guest::CR3, 0);
     vmwrite(vmcs::guest::GDTR_BASE, 0);
     vmwrite(vmcs::guest::GDTR_LIMIT, 0);
     vmwrite(vmcs::guest::IDTR_BASE, 0);
     vmwrite(vmcs::guest::IDTR_LIMIT, 0);
-    vmwrite(vmcs::guest::CS_ACCESS_RIGHTS, 3 | (1<<4) | (1<<7));
+    vmwrite(vmcs::guest::CS_ACCESS_RIGHTS, 0xB | (1<<4) | (1<<7));
     vmwrite(vmcs::guest::CS_BASE, 0xFFFF0000);
     vmwrite(vmcs::guest::CS_LIMIT, 0xFFFF);
     vmwrite(vmcs::guest::CS_SELECTOR, 0xF000);
@@ -387,7 +385,7 @@ unsafe fn vmexit_handler() {
     print!("vmexit ({exit_reason:x}) ");
     if exit_reason == 48 {
         let ept_violation_addr = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL).expect("failed to get EPT violation guest address");
-        print!("{ept_violation_addr:x}");
+        panic!("unhandled EPT violation at {ept_violation_addr:x}");
     }
     println!();
     if exit_reason == 2 {

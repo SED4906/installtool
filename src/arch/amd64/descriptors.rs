@@ -1,6 +1,6 @@
 use spin::Mutex;
 use x86_64::instructions::tables::load_tss;
-use x86_64::registers::segmentation::{Segment, SegmentSelector, CS, DS, SS};
+use x86_64::registers::segmentation::{Segment, SegmentSelector, CS};
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::structures::tss::TaskStateSegment;
