@@ -1,3 +1,4 @@
+use core::arch::asm;
 use core::ptr::addr_of;
 
 use limine::memory_map::EntryType;
@@ -5,6 +6,7 @@ use x86::bits64::registers::rsp;
 use x86::bits64::vmx::{vmclear, vmlaunch, vmptrld, vmread, vmresume, vmwrite, vmxon};
 
 use x86::controlregs::{self, cr3};
+use x86::cpuid::native_cpuid::cpuid_count;
 use x86::cpuid::CpuId;
 use x86::msr::{self, IA32_VMX_ENTRY_CTLS, IA32_VMX_EXIT_CTLS, IA32_VMX_PINBASED_CTLS, IA32_VMX_PROCBASED_CTLS, IA32_VMX_PROCBASED_CTLS2};
 use x86::vmx::vmcs::control::{ExitControls, PrimaryControls, SecondaryControls};
@@ -223,7 +225,9 @@ pub unsafe fn setup_ept(eptp: u64) {
             current_page += 4096;
         }
     }
-    map_ept_page_4kb(eptp, 0xfffff000, 0xff000);
+    for bios_rom_page in (0xe0000..0x100000).step_by(0x1000) {
+        map_ept_page_4kb(eptp, 0xfff00000 | bios_rom_page, bios_rom_page);
+    }
 }
 
 pub unsafe fn init() {
@@ -241,8 +245,11 @@ pub unsafe fn init() {
     let vmcs_root = Freelist::alloc::<VmxonRegion>();
     let vmcs_guest = Freelist::alloc::<VmxonRegion>();
     let guest_eptp = Freelist::alloc::<u64>() as u64;
+    let msr_bitmap = Freelist::alloc::<()>() as u64;
     (*(guest_eptp as *mut [u8;4096])).fill(0);
     (*(vmcs_guest as *mut [u8;4096])).fill(0);
+    (*(msr_bitmap as *mut [u8;4096])).fill(0);
+
 
     setup_ept(guest_eptp);
     (*vmcs_root).revision_id = vmcs_revision_id;
@@ -312,7 +319,8 @@ pub unsafe fn init() {
         adjust
     });
     vmwrite(vmcs::guest::LINK_PTR_FULL, 0xFFFFFFFFFFFFFFFF);
-    //vmwrite(vmcs::control::EXCEPTION_BITMAP, 0xFFFFFFFF);
+    vmwrite(vmcs::control::EXCEPTION_BITMAP, 0xFFFFFFFF);
+    vmwrite(vmcs::control::MSR_BITMAPS_ADDR_FULL, msr_bitmap);
 
     let ia32_vmx_cr0_fixed0 = unsafe { msr::rdmsr(msr::IA32_VMX_CR0_FIXED0) };
     let ia32_vmx_cr0_fixed1 = unsafe { msr::rdmsr(msr::IA32_VMX_CR0_FIXED1) };
@@ -380,9 +388,38 @@ pub unsafe fn init() {
     cpu::wait_forever()
 }
 
-unsafe fn vmexit_handler() {
+#[naked]
+unsafe extern "C" fn vmexit_handler() {
+    asm!("push rax; push rbx; push rcx; push rdx",
+    "push rsi; push rdi; push rbp",
+    "push r8; push r9; push r10; push r11",
+    "push r12; push r13; push r14; push r15",
+    "mov rdi, rsp",
+    "call rust_vmexit_handler",
+    "pop r15; pop r14; pop r13; pop r12",
+    "pop r11; pop r10; pop r9; pop r8",
+    "pop rbp; pop rdi; pop rsi",
+    "pop rdx; pop rcx; pop rbx; pop rax",
+    "vmresume",options(noreturn));
+}
+
+#[no_mangle]
+unsafe extern "C" fn rust_vmexit_handler(state_on_stack: *mut u64) {
     let exit_reason = vmread(vmcs::ro::EXIT_REASON).expect("failed to get exit reason");
     print!("vmexit ({exit_reason:x}) ");
+    if exit_reason == 10 {
+        let rax_in = *state_on_stack.add(14);
+        let rcx_in = *state_on_stack.add(12);
+        let result = cpuid_count(rax_in as u32, rcx_in as u32);
+        *state_on_stack.add(14) = result.eax as u64;
+        *state_on_stack.add(13) = result.ebx as u64;
+        *state_on_stack.add(12) = result.ecx as u64;
+        *state_on_stack.add(11) = result.edx as u64;
+        let guest_rip = vmread(vmcs::guest::RIP).expect("couldn't read guest RIP");
+        let inst_len = vmread(vmcs::ro::VMEXIT_INSTRUCTION_LEN).expect("couldn't get instruction length");
+        vmwrite(vmcs::guest::RIP, guest_rip + inst_len);
+        return;
+    }
     if exit_reason == 48 {
         let ept_violation_addr = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL).expect("failed to get EPT violation guest address");
         panic!("unhandled EPT violation at {ept_violation_addr:x}");
@@ -391,11 +428,5 @@ unsafe fn vmexit_handler() {
     if exit_reason == 2 {
         panic!("guest system died of death");
     }
-    match vmresume() {
-        Ok(()) => {},
-        Err(_) => {
-            let error = vmread(vmcs::ro::VM_INSTRUCTION_ERROR).expect("failed to read error code");
-            panic!("vmresume failed ({error})");
-        },
-    }
+    panic!("unhandled exit");
 }
